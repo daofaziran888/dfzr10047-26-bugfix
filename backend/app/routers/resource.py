@@ -8,8 +8,9 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 
-from app.schemas import ActionPayload, ActionResult, EntryPayload, PageResult
+from app.schemas import ActionPayload, ActionResult, CorrectionPayload, EntryPayload, PageResult
 from app.services import service_for
+from app.services.parse_metric import ParseMetricService
 
 router = APIRouter(prefix="/api", tags=["业务资源"])
 
@@ -19,6 +20,56 @@ def require_service(module: str):
     if service is None:
         raise HTTPException(status_code=404, detail=f"未知业务模块：{module}")
     return service
+
+
+def require_metric_service() -> ParseMetricService:
+    service = require_service("parse_metric")
+    assert isinstance(service, ParseMetricService)
+    return service
+
+
+# ----------------------------------------------------------------------
+# 解析指标复核详情与更正入口：渠道和时间窗筛选、归属校验都在服务端完成
+# ----------------------------------------------------------------------
+@router.get("/parse_metric/{entry_id}/review_detail")
+def metric_review_detail(entry_id: int) -> dict[str, Any]:
+    """复核详情：返回真正属于该读数的动作清单、迟到凭据与原账读数。"""
+    service = require_metric_service()
+    detail = service.review_detail_by_id(entry_id)
+    if detail is None:
+        raise HTTPException(status_code=404, detail=f"指标读数 {entry_id} 不存在或已归档")
+    return detail
+
+
+@router.post("/parse_metric/{entry_id}/correction", response_model=ActionResult)
+def metric_correction(entry_id: int, payload: CorrectionPayload) -> ActionResult:
+    """更正入口：并入迟到凭据重算回退率，原账与证据保留。"""
+    service = require_metric_service()
+    entry = service.get_entry(entry_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail=f"指标读数 {entry_id} 不存在或已归档")
+    ok, message, reading = service.apply_correction(
+        str(entry.get("指标读数编号") or ""),
+        payload.decision_nos,
+        payload.reviewer or "web-reviewer",
+        payload.corrected_at,
+    )
+    return ActionResult(ok=ok, message=message, entry=reading)
+
+
+@router.post("/parse_metric/{entry_id}/defer_receipts", response_model=ActionResult)
+def metric_defer_receipts(entry_id: int, payload: CorrectionPayload) -> ActionResult:
+    """沿用旧证据核对当次发布：迟到凭据转待补算，读数保持原账。"""
+    service = require_metric_service()
+    entry = service.get_entry(entry_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail=f"指标读数 {entry_id} 不存在或已归档")
+    ok, message, reading = service.defer_late_receipts(
+        str(entry.get("指标读数编号") or ""),
+        payload.reviewer or "web-reviewer",
+        payload.corrected_at,
+    )
+    return ActionResult(ok=ok, message=message, entry=reading)
 
 
 @router.get("/{module}", response_model=PageResult[dict])

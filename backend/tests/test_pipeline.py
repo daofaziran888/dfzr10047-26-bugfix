@@ -2199,6 +2199,164 @@ class TestParseMetricService:
         assert rate > 0
 
 
+class TestParseMetricWindowAttribution:
+    """日报窗口回退读数：渠道与时间窗归属、迟到凭据更正、原账保留。"""
+
+    def _add_intake(self, batch_no: str, channel: str) -> None:
+        rows = store.rows("file_intake")
+        rows.append({
+            "id": max(int(r["id"]) for r in rows) + 1,
+            "status": "已入库", "pending": False, "abnormal": False,
+            "批次编号": batch_no, "来源渠道": channel,
+            "原始文件名": f"{batch_no}.csv", "字节大小": "100",
+            "投递时间": "2026-09-10T07:00:00", "文件后缀": ".csv",
+            "声明格式": "csv", "接收节点": "node-01",
+        })
+
+    def _add_route(self, decision_no: str, batch_no: str,
+                   fallbacks: int, decide_time: str) -> None:
+        rows = store.rows("parser_route")
+        rows.append({
+            "id": max(int(r["id"]) for r in rows) + 1,
+            "status": "已回退" if fallbacks else "已选定",
+            "pending": False, "abnormal": bool(fallbacks),
+            "决策编号": decision_no, "关联批次": batch_no,
+            "推断格式": "csv-utf8",
+            "命中解析器": "csv_parser_v1" if fallbacks else "csv_parser_v2",
+            "备选解析器": "csv_parser_v1", "路由依据": "窗口归属测试",
+            "回退次数": str(fallbacks), "决策时间": decide_time,
+        })
+
+    def _prepare(self) -> None:
+        self._add_intake("FI-A1", "chan-a")
+        self._add_intake("FI-A2", "chan-a")
+        self._add_intake("FI-B1", "chan-b")
+        # A 窗内首选成功
+        self._add_route("PR-A-IN-OK", "FI-A1", 0, "2026-09-10T08:00:00")
+        # B 窗内回退（别的来源，不得进入 A 的读数）
+        self._add_route("PR-B-IN-FB", "FI-B1", 1, "2026-09-10T09:00:00")
+        # A 窗外回退（别的窗口，不得进入本窗口读数）
+        self._add_route("PR-A-OUT-FB", "FI-A2", 1, "2026-09-11T08:00:00")
+
+    def test_window_reading_excludes_other_channel_and_window(self, fresh_store):
+        svc = SERVICES["parse_metric"]
+        self._prepare()
+        ok, _msg, reading = svc.settle_reading(
+            "PM-W1", "20260910", "chan-a", "2026-09-11T00:00:00")
+        assert ok is True
+        # A 当次应是 0/1：B 与窗外决策都不得进入分子分母
+        assert reading["回退决策计数"] == "0"
+        assert reading["路由决策计数"] == "1"
+        assert reading["回退率"] == "0.0000"
+        assert reading["计入决策编号"] == "PR-A-IN-OK"
+
+    def test_late_receipt_conflict_and_correction(self, fresh_store):
+        svc = SERVICES["parse_metric"]
+        self._prepare()
+        svc.settle_reading("PM-W1", "20260910", "chan-a", "2026-09-11T00:00:00")
+        # 打开日报后，A 窗内回退凭据迟到
+        self._add_route("PR-A-IN-FB", "FI-A1", 1, "2026-09-10T10:00:00")
+        detail = svc.review_detail("PM-W1")
+        assert detail["核对冲突"] is True
+        assert [i["决策编号"] for i in detail["迟到凭据"]] == ["PR-A-IN-FB"]
+        assert [i["决策编号"] for i in detail["动作清单"]] == ["PR-A-IN-OK"]
+        # 已打开的日报固定显示原账读数
+        assert detail["当前"]["回退决策计数"] == "0"
+        assert detail["当前"]["路由决策计数"] == "1"
+        # 服务端归属校验：B 与窗外凭据不得进入本次读数
+        ok, msg, _ = svc.apply_correction(
+            "PM-W1", ["PR-A-IN-FB", "PR-B-IN-FB"], "reviewer-01", "t")
+        assert ok is False
+        assert "归属校验" in msg
+        ok, msg, _ = svc.apply_correction("PM-W1", ["PR-A-OUT-FB"], "reviewer-01", "t")
+        assert ok is False
+        assert "归属校验" in msg
+        # 从更正入口提交迟到的 A 窗内回退
+        ok, _msg, reading = svc.apply_correction(
+            "PM-W1", ["PR-A-IN-FB"], "reviewer-01", "2026-09-11T01:00:00")
+        assert ok is True
+        assert reading["回退决策计数"] == "1"
+        assert reading["路由决策计数"] == "2"
+        assert reading["回退率"] == "0.5000"
+        assert reading["status"] == "已结算"
+        # 旧 0/1 的原证据保留，迟到修订可核对旧值和新值
+        assert reading["原账回退率"] == "0.0000"
+        assert reading["原账回退决策计数"] == "0"
+        assert reading["原账路由决策计数"] == "1"
+        assert reading["原账计入决策编号"] == "PR-A-IN-OK"
+        # B 和窗外均不在分子里
+        assert reading["回退决策编号"] == "PR-A-IN-FB"
+        # 调整后的读数可重新核对：比率和实际分子分母一致
+        ok, msg = svc.cross_check("PM-W1")
+        assert ok is True, msg
+        # 重新打开复核详情：冲突消除，动作清单含两笔，原账仍可查
+        detail = svc.review_detail("PM-W1")
+        assert detail["核对冲突"] is False
+        assert [i["决策编号"] for i in detail["动作清单"]] == [
+            "PR-A-IN-OK", "PR-A-IN-FB"]
+        assert detail["原账"]["回退率"] == "0.0000"
+        assert detail["原账"]["计入决策编号"] == "PR-A-IN-OK"
+
+    def test_decision_counted_only_once(self, fresh_store):
+        svc = SERVICES["parse_metric"]
+        self._prepare()
+        svc.settle_reading("PM-W1", "20260910", "chan-a", "t")
+        self._add_route("PR-A-IN-FB", "FI-A1", 1, "2026-09-10T10:00:00")
+        # 重复提交同一凭据 + 已计入凭据，仍只算一次
+        ok, _msg, reading = svc.apply_correction(
+            "PM-W1", ["PR-A-IN-FB", "PR-A-IN-FB", "PR-A-IN-OK"], "r", "t")
+        assert ok is True
+        assert reading["路由决策计数"] == "2"
+        assert reading["回退决策计数"] == "1"
+        # 全部已计入后再次提交 → 拒绝
+        ok, msg, _ = svc.apply_correction("PM-W1", ["PR-A-IN-FB"], "r", "t")
+        assert ok is False
+        assert "只算一次" in msg
+
+    def test_defer_late_receipts_keeps_original(self, fresh_store):
+        svc = SERVICES["parse_metric"]
+        self._prepare()
+        svc.settle_reading("PM-W1", "20260910", "chan-a", "t")
+        self._add_route("PR-A-IN-FB", "FI-A1", 1, "2026-09-10T10:00:00")
+        # 复核员决定继续用旧证据核对当次发布
+        ok, _msg, reading = svc.defer_late_receipts(
+            "PM-W1", "reviewer-02", "2026-09-11T02:00:00")
+        assert ok is True
+        assert reading["回退率"] == "0.0000"
+        assert reading["待补算决策编号"] == "PR-A-IN-FB"
+        assert reading["status"] == "已结算"
+        detail = svc.review_detail("PM-W1")
+        assert detail["核对冲突"] is False
+        assert [i["决策编号"] for i in detail["待补算凭据"]] == ["PR-A-IN-FB"]
+        assert [i["决策编号"] for i in detail["动作清单"]] == ["PR-A-IN-OK"]
+
+    def test_settled_reading_not_silently_overwritten(self, fresh_store):
+        svc = SERVICES["parse_metric"]
+        self._prepare()
+        svc.settle_reading("PM-W1", "20260910", "chan-a", "t")
+        self._add_route("PR-A-IN-FB", "FI-A1", 1, "2026-09-10T10:00:00")
+        ok, msg, _reading = svc.settle_reading("PM-W1", "20260910", "chan-a", "t2")
+        assert ok is False
+        assert "更正入口" in msg
+        row = next(r for r in store.rows("parse_metric")
+                   if r["指标读数编号"] == "PM-W1")
+        assert row["回退率"] == "0.0000"
+
+    def test_review_list_annotates_conflict(self, fresh_store):
+        svc = SERVICES["parse_metric"]
+        self._prepare()
+        svc.settle_reading("PM-W1", "20260910", "chan-a", "t")
+        self._add_route("PR-A-IN-FB", "FI-A1", 1, "2026-09-10T10:00:00")
+        items, _total = svc.list_entries(filters={"指标读数编号": "PM-W1"})
+        assert items[0]["核对冲突"] is True
+        assert items[0]["迟到凭据数"] == "1"
+        # 更正后复核清单同步：冲突标记消除
+        svc.apply_correction("PM-W1", ["PR-A-IN-FB"], "reviewer-01", "t")
+        items, _total = svc.list_entries(filters={"指标读数编号": "PM-W1"})
+        assert items[0]["核对冲突"] is False
+        assert items[0]["status"] == "已结算"
+
+
 class TestUnitNormalizeService:
     def test_conflicting_factor_blocks_activation(self, fresh_store):
         svc = SERVICES["unit_normalize"]

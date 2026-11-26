@@ -33,6 +33,13 @@ body { margin: 0; background: #f6f8fb; color: #1f2937; }
 .link { border: none; background: none; color: var(--brand); cursor: pointer; padding: 0; }
 .page-foot { display: flex; justify-content: space-between; margin-top: 8px; font-size: 12px; color: var(--muted); }
 .error-text { color: #b42318; }
+.conflict-badge { display: inline-block; margin-left: 6px; padding: 1px 6px; border-radius: 4px; background: #fef3c7; color: #92400e; font-size: 12px; }
+.review-modal { width: min(760px, 100%); }
+.review-modal h4 { margin: 14px 0 6px; font-size: 13px; }
+.review-meta { color: var(--muted); font-size: 12px; margin: 4px 0; }
+.review-current { font-weight: 600; margin: 6px 0; }
+.review-original { color: var(--muted); font-size: 13px; margin: 4px 0; }
+.review-conclusion { background: #f0f6ff; border: 1px solid #bfdbfe; border-radius: 6px; padding: 8px 10px; font-size: 13px; }
 .modal-backdrop { position: fixed; inset: 0; background: rgb(15 23 42 / 35%); display: grid; place-items: center; padding: 20px; z-index: 20; }
 .modal { width: min(560px, 100%); max-height: 90vh; overflow: auto; background: #fff; border-radius: 12px; padding: 20px; box-shadow: 0 20px 50px rgb(15 23 42 / 20%); }
 .create-field { display: block; margin-bottom: 10px; }

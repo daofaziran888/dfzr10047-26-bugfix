@@ -29,3 +29,10 @@ class EntryPayload(BaseModel):
 class ActionPayload(BaseModel):
     action: str
     remark: str | None = None
+
+
+class CorrectionPayload(BaseModel):
+    """指标读数更正入口的提交体：迟到凭据清单 + 复核员信息。"""
+    decision_nos: list[str] = Field(default_factory=list)
+    reviewer: str = ""
+    corrected_at: str = ""

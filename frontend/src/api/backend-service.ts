@@ -1,6 +1,6 @@
 import { request } from './client'
 import { moduleMeta } from '@/data/modules'
-import type { ActionResult, EntryRow, OverviewResult, PageResult } from '@/data/types'
+import type { ActionResult, EntryRow, MetricReviewDetail, OverviewResult, PageResult } from '@/data/types'
 
 export { moduleMeta }
 
@@ -57,5 +57,33 @@ export async function downloadEntries(
 export async function loadOverview(): Promise<OverviewResult> {
   const response = await request('/api/overview')
   if (!response.ok) throw new Error('运营概览读取失败')
+  return await response.json()
+}
+
+/** 解析指标复核详情：动作清单、迟到凭据与原账都由服务端按渠道和窗口筛好。 */
+export async function fetchMetricReviewDetail(id: number): Promise<MetricReviewDetail> {
+  const response = await request(`/api/parse_metric/${id}/review_detail`)
+  if (!response.ok) throw new Error('复核详情读取失败')
+  return await response.json()
+}
+
+/** 更正入口：把选中的迟到凭据并入读数，服务端做归属校验。 */
+export async function correctMetricReading(
+  id: number,
+  decisionNos: string[],
+): Promise<ActionResult> {
+  const response = await request(`/api/parse_metric/${id}/correction`, {
+    method: 'POST',
+    body: JSON.stringify({ decision_nos: decisionNos, reviewer: 'web-reviewer' }),
+  })
+  return await response.json()
+}
+
+/** 沿用旧证据核对当次发布：迟到凭据转待补算，读数保持原账。 */
+export async function deferMetricReceipts(id: number): Promise<ActionResult> {
+  const response = await request(`/api/parse_metric/${id}/defer_receipts`, {
+    method: 'POST',
+    body: JSON.stringify({ reviewer: 'web-reviewer' }),
+  })
   return await response.json()
 }
